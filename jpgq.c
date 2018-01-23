@@ -8,13 +8,17 @@ TODOs:
   - Try converting to different color space
   - Try different color distance metric altogether
 - Improve the way the final pixel values are determined
-  - Down-scale the image down after quantization
+  - Down-scale the image after quantization
   - Add dithering to the output image
-  - Try using edge detection if dithering is too hard to control
+  - Try using edge detection if dithering is too hard to control  
+- Improve the way the color palette is calculated
+  - Try different initialization schemes to replace the random starting values,
+    e.g. a lattice structure, or randomly selected, unique samples from the image.
+  - Run the clustering algorithm multiple times with different starting values,
+    pick the best result (try different perceived-image-difference metrics!)
 - Speed this thing up; I want to do (at least) Full HD input images and a
   256-color palette, running as many iterations as necessary to early-exit,
   and I _never_ want to wait more than a couple seconds
-  - measure time per iteration, as well as perf of individual steps 
   - do the equivalent of a sort + RLE on the input image to speed up the
     palette adjustment step
   - write SIMD variations of the most expensive functions (presumably starting
@@ -23,8 +27,6 @@ TODOs:
   - (optionally) shrink the search space (e.g. 15-bit RGB color palette)
 - Improve the CLI so that no recompilation is necessary for changing an
   effect parameter, turning features on/off, etc.
-- Try different initialization schemes to replace the random starting values,
-  e.g. a lattice structure, or randomly selected, unique samples from the image.
 *******************************************************************************/
 
 #include "stdint.h"
@@ -45,8 +47,62 @@ TODOs:
     if (!(E)) *((int *)0); \
 } while (0);
 
+#define mfree(P) do { \
+    assert(P);        \
+    free(P); P = 0;   \
+} while (0);
+
+#include "windows.h"
+
+typedef struct {
+    LARGE_INTEGER perf_counter;
+    int64_t       cycle_count;
+} TimeStamp;
+
+typedef struct {
+    double  milliseconds;
+    int64_t cycles;
+} ElapsedTime;
+
+// NOTE: When we parallelize, we need one of these per thread to get correct timing values
+static double perf_counter_freq = 0;
+
+static inline void init_time() {
+    LARGE_INTEGER counter_frequency;
+    QueryPerformanceFrequency(&counter_frequency);
+    
+    perf_counter_freq = (double)(counter_frequency.QuadPart) / 1000.0;
+}
+
+static inline TimeStamp start_timer() {
+    TimeStamp result;
+    
+    QueryPerformanceCounter(&result.perf_counter);
+    result.cycle_count = __rdtsc();
+    
+    return result;
+}
+
+static inline ElapsedTime end_timer(TimeStamp start) {
+    int64_t end_cycles = __rdtsc();
+    
+    LARGE_INTEGER end_counter;
+    QueryPerformanceCounter(&end_counter);
+    
+    ElapsedTime result;
+    result.cycles = end_cycles - start.cycle_count;
+    result.milliseconds = (double)(end_counter.QuadPart - start.perf_counter.QuadPart) / perf_counter_freq;
+    
+    return result;
+}
+
 typedef uint64_t Random;
 static inline uint32_t next_rand(Random * rng) {
+    // This code is stolen from http://www.pcg-random.org/download.html
+    
+    // *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
+    // Licensed under Apache License 2.0 (NO WARRANTY, etc. see website)
+    
     uint64_t oldstate = *rng;
     *rng = oldstate * 0x5851F42D4C957F2DULL + (0xFF34C1F839BE198FULL);
     
@@ -84,7 +140,10 @@ static inline uint32_t img_read(unsigned char * img_data, uint32_t pixel_idx) {
     return result;
 }
 
+
 int main(int argc, char ** argv) {
+    init_time();
+    
     if (argc < 2) {
         printf("jpgq: You need to provide an image file as an argument.");
         return -1;
@@ -106,7 +165,9 @@ int main(int argc, char ** argv) {
         return -3;
     }
     
-    // Initialize color palette to random colors:
+    printf(">>> Initializing ...\t");
+    TimeStamp init_start_time = start_timer();
+    
     Random rng = 0x9709FDD653807BFEULL;
     
     uint32_t palette[PALETTE_SIZE];
@@ -115,8 +176,13 @@ int main(int argc, char ** argv) {
         palette[j] = nr & 0x00FFFFFF;
     }
     
+    ElapsedTime init_time_elapsed = end_timer(init_start_time);
+    printf("Completed in %f ms (%lld cycles)\n", init_time_elapsed.milliseconds, init_time_elapsed.cycles);
+    
     for (int k = 0; k < ITERATIONS; ++k) {
-        printf(">>>\tIteration %d...\n", k + 1);
+        printf(">>> Iteration %d ...\t", k + 1);
+        
+        TimeStamp iter_start_time = start_timer();
         
         // Find closest palette color for each pixel:
         for (int i = 0; i < img_size; ++i) {
@@ -178,6 +244,9 @@ int main(int argc, char ** argv) {
                 updated = 1;
             }
         }
+        
+        ElapsedTime iter_time_elapsed = end_timer(iter_start_time);
+        printf("Completed in %f ms (%lld cycles)\n", iter_time_elapsed.milliseconds, iter_time_elapsed.cycles);
         
         if (!updated) break;
     }

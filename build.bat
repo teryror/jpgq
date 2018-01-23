@@ -1,3 +1,3 @@
 @echo off
 
-cl -Zi jpgq.c
+cl -O2 -Zi jpgq.c
