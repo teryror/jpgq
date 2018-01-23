@@ -13,9 +13,8 @@ TODOs:
   - Try using edge detection if dithering is too hard to control  
 - Improve the way the color palette is calculated
   - Try different initialization schemes to replace the random starting values,
-    e.g. a lattice structure, or randomly selected, unique samples from the image.
-  - Run the clustering algorithm multiple times with different starting values,
-    pick the best result (try different perceived-image-difference metrics!)
+    e.g. a lattice structure.
+  - Try different perceived-image-difference metrics, e.g. SSIM
 - Speed this thing up; I want to do (at least) Full HD input images and a
   256-color palette, running as many iterations as necessary to early-exit,
   and I _never_ want to wait more than a couple seconds
@@ -28,6 +27,7 @@ TODOs:
 *******************************************************************************/
 
 #include "stdint.h"
+#include "float.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_LINEAR
@@ -38,6 +38,7 @@ TODOs:
 #include "stb_image_write.h"
 
 #define PALETTE_SIZE  32
+#define BEST_PAL_OF    8
 #define ITERATIONS   128
 
 #undef assert
@@ -178,9 +179,11 @@ int main(int argc, char ** argv) {
     // in-order, for deciding the final pixel values more quickly
     
     uint32_t * px_values = (uint32_t *) malloc(sizeof(uint32_t) * img_size);
+    uint32_t * img_padded = (uint32_t *) malloc(sizeof(uint32_t) * img_size);
     for (int i = 0; i < img_size; ++i) {
         uint32_t px = img_read(img_data, i);
         px_values[i] = px;
+        img_padded[i] = px;
     }
     
     ElapsedTime conv_time_elapsed = end_timer(conv_start_time);
@@ -231,102 +234,177 @@ int main(int argc, char ** argv) {
     printf("Completed in %f ms (%lld cycles). Counted %zd unique colors in %d pixels.\n",
            hist_time_elapsed.milliseconds, hist_time_elapsed.cycles,
            unique_colors_count, img_size);
-    // ------------------------------------------------------------------------
-    printf(">>> Initializing Color Palette ...\n");
-    TimeStamp init_start_time = start_timer();
+    
+    // 
+    // Begin Clustering
+    // 
     
     Random rng = 0x9709FDD653807BFEULL;
+    uint32_t best_palette[PALETTE_SIZE];
+    double best_psnr = 0;
     
-    uint32_t palette[PALETTE_SIZE];
-    for (int j = 0; j < PALETTE_SIZE; ++j) {
-        uint32_t nr = next_rand(&rng);
-        palette[j] = nr & 0x00FFFFFF;
-    }
-    
-    ElapsedTime init_time_elapsed = end_timer(init_start_time);
-    printf("Completed in %f ms (%lld cycles)\n",
-           init_time_elapsed.milliseconds,
-           init_time_elapsed.cycles);
-    // ------------------------------------------------------------------------
-    for (int k = 0; k < ITERATIONS; ++k) {
-        printf(">>> Iteration %d ...\t", k + 1);
+    for (int l = 0; l < BEST_PAL_OF; ++l) {
+        printf(">>> Generating Palette %d ...\t", l);
+        uint32_t palette[PALETTE_SIZE];
         
-        TimeStamp iter_start_time = start_timer();
+        // ------------------------------------------------------------------------
+        TimeStamp init_start_time = start_timer();
         
-        // Find closest palette color for each unique color:
-        for (int i = 0; i < unique_colors_count; ++i) {
-            unsigned char min_idx = 0;
-            float min_dst = color_dist(unique_colors[i], palette[0]);
+#if 1
+        // Choose fully random starting values
+        for (int j = 0; j < PALETTE_SIZE; ++j) {
+            uint32_t nr = next_rand(&rng);
+            palette[j] = nr & 0x00FFFFFF;
+        }
+#else
+        // Uniformly draw PALETTE_SIZE samples from unique_colors without
+        // replacement using Knuth's algorithm (TAOCP Vol.2, I think?)
+        // Note that we're not using the histogram to adjust the weighting.
+        int palette_colors_drawn = 0;
+        
+        for (int i = 0; i < unique_colors_count &&
+             palette_colors_drawn < PALETTE_SIZE; ++i)
+        {
+            // NOTE: This is not _truly_ uniform, but probably close enough
+            uint32_t nr = next_rand(&rng) % (unique_colors_count - i);
             
-            for (int j = 1; j < PALETTE_SIZE; ++j) {
-                float dst = color_dist(unique_colors[i], palette[j]);
-                if (dst < min_dst) {
-                    min_idx = (unsigned char)j;
-                    min_dst = dst;
+            if (nr < (PALETTE_SIZE - palette_colors_drawn)) {
+                palette[palette_colors_drawn] = unique_colors[i];
+                palette_colors_drawn += 1;
+            }
+        }
+        
+        assert(palette_colors_drawn == PALETTE_SIZE);
+#endif
+        
+        ElapsedTime init_time_elapsed = end_timer(init_start_time);
+        // ------------------------------------------------------------------------
+        int steps = 0;
+        double best_step_time = DBL_MAX;
+        
+        for (; steps < ITERATIONS; ++steps) {
+            TimeStamp iter_start_time = start_timer();
+            
+            // Find closest palette color for each unique color:
+            for (int i = 0; i < unique_colors_count; ++i) {
+                unsigned char min_idx = 0;
+                float min_dst = color_dist(unique_colors[i], palette[0]);
+                
+                for (int j = 1; j < PALETTE_SIZE; ++j) {
+                    float dst = color_dist(unique_colors[i], palette[j]);
+                    if (dst < min_dst) {
+                        min_idx = (unsigned char)j;
+                        min_dst = dst;
+                    }
+                }
+                
+                pal_idxs[i] = min_idx;
+            }
+            
+            // Adjust color palette:
+            uint64_t counts[PALETTE_SIZE];
+            uint64_t sums_r[PALETTE_SIZE];
+            uint64_t sums_g[PALETTE_SIZE];
+            uint64_t sums_b[PALETTE_SIZE];
+            
+            for (int j = 0; j < PALETTE_SIZE; ++j) {
+                sums_r[j] = 0;
+                sums_g[j] = 0;
+                sums_b[j] = 0;
+                counts[j] = 0;
+            }
+            
+            for (int i = 0; i < unique_colors_count; ++i) {
+                unsigned char pal_idx = pal_idxs[i];
+                
+                uint32_t col_r = unique_colors[i] >> 16;
+                sums_r[pal_idx] += col_r * color_counts[i];
+                
+                uint32_t col_g = (unique_colors[i] >> 8) & 0xFF;
+                sums_g[pal_idx] += col_g * color_counts[i];
+                
+                uint32_t col_b = unique_colors[i] & 0xFF;
+                sums_b[pal_idx] += col_b * color_counts[i];
+                
+                counts[pal_idx] += color_counts[i];
+            }
+            
+            int updated = 0;
+            for (int j = 0; j < PALETTE_SIZE; ++j) {
+                assert(counts[j]);
+                
+                int32_t avg_r = (int32_t) round((float)sums_r[j] / (float)counts[j]);
+                int32_t avg_g = (int32_t) round((float)sums_g[j] / (float)counts[j]);
+                int32_t avg_b = (int32_t) round((float)sums_b[j] / (float)counts[j]);
+                
+                assert(avg_r > 0 && avg_r < 256);
+                assert(avg_g > 0 && avg_g < 256);
+                assert(avg_b > 0 && avg_b < 256);
+                
+                uint32_t palette_old = palette[j];
+                
+                palette[j] = 0;
+                palette[j] |= (uint32_t)avg_r << 16;
+                palette[j] |= (uint32_t)avg_g << 8;
+                palette[j] |= (uint32_t)avg_b;
+                
+                if (palette[j] != palette_old) {
+                    updated = 1;
                 }
             }
             
-            pal_idxs[i] = min_idx;
+            ElapsedTime iter_time_elapsed = end_timer(iter_start_time);
+            if (iter_time_elapsed.milliseconds < best_step_time) {
+                best_step_time = iter_time_elapsed.milliseconds;
+            }
+            
+            if (!updated) break;
         }
         
-        // Adjust color palette:
-        uint64_t counts[PALETTE_SIZE];
-        uint64_t sums_r[PALETTE_SIZE];
-        uint64_t sums_g[PALETTE_SIZE];
-        uint64_t sums_b[PALETTE_SIZE];
+        printf("Converged after %d steps.\t", steps);
+        // ------------------------------------------------------------------------
+        TimeStamp psnr_start_time = start_timer();
         
-        for (int j = 0; j < PALETTE_SIZE; ++j) {
-            sums_r[j] = 0;
-            sums_g[j] = 0;
-            sums_b[j] = 0;
-            counts[j] = 0;
-        }
-        
+        int64_t square_error_sum = 0;
         for (int i = 0; i < unique_colors_count; ++i) {
             unsigned char pal_idx = pal_idxs[i];
+            uint32_t pal_color = palette[pal_idx];
+            uint32_t tru_color = unique_colors[i];
             
-            uint32_t col_r = unique_colors[i] >> 16;
-            sums_r[pal_idx] += col_r * color_counts[i];
+            int32_t pal_r = pal_color >> 16;
+            int32_t tru_r = tru_color >> 16;
+            int32_t dr = pal_r - tru_r;
             
-            uint32_t col_g = (unique_colors[i] >> 8) & 0xFF;
-            sums_g[pal_idx] += col_g * color_counts[i];
+            int32_t pal_g = (pal_color >> 8) & 0xFF;
+            int32_t tru_g = (tru_color >> 8) & 0xFF;
+            int32_t dg = pal_g - tru_g;
             
-            uint32_t col_b = unique_colors[i] & 0xFF;
-            sums_b[pal_idx] += col_b * color_counts[i];
+            int32_t pal_b = pal_color & 0xFF;
+            int32_t tru_b = tru_color & 0xFF;
+            int32_t db = pal_b - tru_b;
             
-            counts[pal_idx] += color_counts[i];
+            int64_t square_error = dr * dr + dg * dg + db * db;
+            square_error_sum += square_error * color_counts[i];
         }
         
-        int updated = 0;
-        for (int j = 0; j < PALETTE_SIZE; ++j) {
-            assert(counts[j]);
-            
-            int32_t avg_r = (int32_t) round((float)sums_r[j] / (float)counts[j]);
-            int32_t avg_g = (int32_t) round((float)sums_g[j] / (float)counts[j]);
-            int32_t avg_b = (int32_t) round((float)sums_b[j] / (float)counts[j]);
-            
-            assert(avg_r > 0 && avg_r < 256);
-            assert(avg_g > 0 && avg_g < 256);
-            assert(avg_b > 0 && avg_b < 256);
-            
-            uint32_t palette_old = palette[j];
-            
-            palette[j] = 0;
-            palette[j] |= (uint32_t)avg_r << 16;
-            palette[j] |= (uint32_t)avg_g << 8;
-            palette[j] |= (uint32_t)avg_b;
-            
-            if (palette[j] != palette_old) {
-                updated = 1;
+        double mean_square_error = (double)square_error_sum / (double)(img_size * 3);
+        double lg10_255_x_20 = 48.130803608679103412429178057179;
+        double peak_signal_noise_ratio = lg10_255_x_20 - 10*log10(mean_square_error);
+        
+        if (peak_signal_noise_ratio > best_psnr) {
+            best_psnr = peak_signal_noise_ratio;
+            for (int j = 0; j < PALETTE_SIZE; ++j) {
+                best_palette[j] = palette[j];
             }
         }
         
-        ElapsedTime iter_time_elapsed = end_timer(iter_start_time);
-        printf("Completed in %f ms (%lld cycles)\n",
-               iter_time_elapsed.milliseconds,
-               iter_time_elapsed.cycles);
+        ElapsedTime psnr_time_elapsed = end_timer(psnr_start_time);
         
-        if (!updated) break;
+        printf("PSNR = %f db.\n", peak_signal_noise_ratio);
+        printf("    Init Time: %f ms\tBest Step Time: %f ms\tPSNR Time: %f ms\n",
+               init_time_elapsed.milliseconds,
+               best_step_time,
+               psnr_time_elapsed.milliseconds);
     }
     // ------------------------------------------------------------------------
     printf(">>> Deciding Final Pixel Values ...\n");
@@ -336,10 +414,10 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < img_size; ++i) {
         // Find closest palette color for current pixel:
         unsigned char pal_idx = 0;
-        float min_dst = color_dist(img_read(img_data, i), palette[0]);
+        float min_dst = color_dist(img_padded[i], best_palette[0]);
         
         for (int j = 1; j < PALETTE_SIZE; ++j) {
-            float dst = color_dist(img_read(img_data, i), palette[j]);
+            float dst = color_dist(img_padded[i], best_palette[j]);
             if (dst < min_dst) {
                 pal_idx = (unsigned char)j;
                 min_dst = dst;
@@ -347,9 +425,9 @@ int main(int argc, char ** argv) {
         }
         
         unsigned char * offset = img_data + (i * 3);
-        offset[0] = (unsigned char)(palette[pal_idx] >> 16);
-        offset[1] = (unsigned char)((palette[pal_idx] >> 8) & 0xFF);
-        offset[2] = (unsigned char)(palette[pal_idx] & 0xFF);
+        offset[0] = (unsigned char)(best_palette[pal_idx] >> 16);
+        offset[1] = (unsigned char)((best_palette[pal_idx] >> 8) & 0xFF);
+        offset[2] = (unsigned char)(best_palette[pal_idx] & 0xFF);
     }
     
     stbi_write_bmp("out3.bmp", width, height, channel_count, img_data);
