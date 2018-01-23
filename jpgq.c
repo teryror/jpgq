@@ -19,8 +19,6 @@ TODOs:
 - Speed this thing up; I want to do (at least) Full HD input images and a
   256-color palette, running as many iterations as necessary to early-exit,
   and I _never_ want to wait more than a couple seconds
-  - do the equivalent of a sort + RLE on the input image to speed up the
-    palette adjustment step
   - write SIMD variations of the most expensive functions (presumably starting
     with the loop finding the closest palette color, followed by the averaging
   - possibly multi-threading, though the need for synchronization may kill us
@@ -131,6 +129,14 @@ static inline float color_dist(uint32_t a, uint32_t b) {
     return result;
 }
 
+static int color_cmp(const void * a, const void * b) {
+    // NOTE: We don't care about the exact ordering semantics, we just want all
+    // identical values to be adjacent in the array, so any consistent comparison
+    // function will do.
+    
+    return ( *(int32_t*)a - *(int32_t*)b );
+}
+
 static inline uint32_t img_read(unsigned char * img_data, uint32_t pixel_idx) {
     uint32_t result = 0;
     img_data += pixel_idx * 3;
@@ -155,7 +161,6 @@ int main(int argc, char ** argv) {
     unsigned char *img_data = stbi_load(filename, &width, &height, &channel_count, 0);
     
     int img_size = width * height;
-    unsigned char *pal_idxs = (char *) malloc(img_size);
     
     if (img_data == 0) {
         printf("jpgq: An error occured while reading the file '%s'!\n", filename);
@@ -165,7 +170,69 @@ int main(int argc, char ** argv) {
         return -3;
     }
     
-    printf(">>> Initializing ...\t");
+    // ------------------------------------------------------------------------
+    printf(">>> Converting Between Color Spaces ...\n");
+    TimeStamp conv_start_time = start_timer();
+    
+    // NOTE: We may want a second copy of the converted values that remains
+    // in-order, for deciding the final pixel values more quickly
+    
+    uint32_t * px_values = (uint32_t *) malloc(sizeof(uint32_t) * img_size);
+    for (int i = 0; i < img_size; ++i) {
+        uint32_t px = img_read(img_data, i);
+        px_values[i] = px;
+    }
+    
+    ElapsedTime conv_time_elapsed = end_timer(conv_start_time);
+    printf("Completed in %f ms (%lld cycles)\n",
+           conv_time_elapsed.milliseconds,
+           conv_time_elapsed.cycles);
+    // ------------------------------------------------------------------------
+    printf(">>> Histogramming Pixel Values ...\n");
+    TimeStamp hist_start_time = start_timer();
+    
+    size_t arr_size = sizeof(uint32_t) << 24;
+    uint32_t * unique_colors = (uint32_t *) malloc(arr_size);
+    uint32_t * color_counts  = (uint32_t *) malloc(arr_size);
+    size_t unique_colors_count = 0;
+    
+    qsort(px_values, img_size, sizeof(px_values[0]), color_cmp);
+    
+    uint32_t current_val = px_values[0];
+    uint32_t current_count = 1;
+    
+    for (int i = 1; i < img_size; ++i) {
+        if (px_values[i] == current_val) {
+            current_count += 1;
+        } else {
+            unique_colors[unique_colors_count] = current_val;
+            color_counts[unique_colors_count] = current_count;
+            unique_colors_count += 1;
+            
+            current_val = px_values[i];
+            current_count = 1;
+        }
+    }
+    
+    // The loop above does not count the final run, so we do that here
+    unique_colors[unique_colors_count] = current_val;
+    color_counts[unique_colors_count] = current_count;
+    unique_colors_count += 1;
+    
+    uint64_t test_sum = 0;
+    for (int i = 0; i < unique_colors_count; ++i) {
+        test_sum += color_counts[i];
+    }
+    assert(test_sum == img_size);
+    
+    unsigned char *pal_idxs = (char *) malloc(unique_colors_count);
+    
+    ElapsedTime hist_time_elapsed = end_timer(hist_start_time);
+    printf("Completed in %f ms (%lld cycles). Counted %zd unique colors in %d pixels.\n",
+           hist_time_elapsed.milliseconds, hist_time_elapsed.cycles,
+           unique_colors_count, img_size);
+    // ------------------------------------------------------------------------
+    printf(">>> Initializing Color Palette ...\n");
     TimeStamp init_start_time = start_timer();
     
     Random rng = 0x9709FDD653807BFEULL;
@@ -177,20 +244,22 @@ int main(int argc, char ** argv) {
     }
     
     ElapsedTime init_time_elapsed = end_timer(init_start_time);
-    printf("Completed in %f ms (%lld cycles)\n", init_time_elapsed.milliseconds, init_time_elapsed.cycles);
-    
+    printf("Completed in %f ms (%lld cycles)\n",
+           init_time_elapsed.milliseconds,
+           init_time_elapsed.cycles);
+    // ------------------------------------------------------------------------
     for (int k = 0; k < ITERATIONS; ++k) {
         printf(">>> Iteration %d ...\t", k + 1);
         
         TimeStamp iter_start_time = start_timer();
         
-        // Find closest palette color for each pixel:
-        for (int i = 0; i < img_size; ++i) {
+        // Find closest palette color for each unique color:
+        for (int i = 0; i < unique_colors_count; ++i) {
             unsigned char min_idx = 0;
-            float min_dst = color_dist(img_read(img_data, i), palette[0]);
+            float min_dst = color_dist(unique_colors[i], palette[0]);
             
             for (int j = 1; j < PALETTE_SIZE; ++j) {
-                float dst = color_dist(img_read(img_data, i), palette[j]);
+                float dst = color_dist(unique_colors[i], palette[j]);
                 if (dst < min_dst) {
                     min_idx = (unsigned char)j;
                     min_dst = dst;
@@ -213,12 +282,19 @@ int main(int argc, char ** argv) {
             counts[j] = 0;
         }
         
-        for (int i = 0; i < img_size; ++i) {
+        for (int i = 0; i < unique_colors_count; ++i) {
             unsigned char pal_idx = pal_idxs[i];
-            sums_r[pal_idx] += img_data[3*i + 0];
-            sums_g[pal_idx] += img_data[3*i + 1];
-            sums_b[pal_idx] += img_data[3*i + 2];
-            counts[pal_idx] += 1;
+            
+            uint32_t col_r = unique_colors[i] >> 16;
+            sums_r[pal_idx] += col_r * color_counts[i];
+            
+            uint32_t col_g = (unique_colors[i] >> 8) & 0xFF;
+            sums_g[pal_idx] += col_g * color_counts[i];
+            
+            uint32_t col_b = unique_colors[i] & 0xFF;
+            sums_b[pal_idx] += col_b * color_counts[i];
+            
+            counts[pal_idx] += color_counts[i];
         }
         
         int updated = 0;
@@ -246,22 +322,42 @@ int main(int argc, char ** argv) {
         }
         
         ElapsedTime iter_time_elapsed = end_timer(iter_start_time);
-        printf("Completed in %f ms (%lld cycles)\n", iter_time_elapsed.milliseconds, iter_time_elapsed.cycles);
+        printf("Completed in %f ms (%lld cycles)\n",
+               iter_time_elapsed.milliseconds,
+               iter_time_elapsed.cycles);
         
         if (!updated) break;
     }
+    // ------------------------------------------------------------------------
+    printf(">>> Deciding Final Pixel Values ...\n");
+    TimeStamp write_start_time = start_timer();
     
     // TEMPORARY: Overwrite img_data with paletized image data
-    // TODO: We really want to scale down the image at some point in the process...
     for (int i = 0; i < img_size; ++i) {
-        unsigned char pal_idx = pal_idxs[i];
+        // Find closest palette color for current pixel:
+        unsigned char pal_idx = 0;
+        float min_dst = color_dist(img_read(img_data, i), palette[0]);
+        
+        for (int j = 1; j < PALETTE_SIZE; ++j) {
+            float dst = color_dist(img_read(img_data, i), palette[j]);
+            if (dst < min_dst) {
+                pal_idx = (unsigned char)j;
+                min_dst = dst;
+            }
+        }
+        
         unsigned char * offset = img_data + (i * 3);
         offset[0] = (unsigned char)(palette[pal_idx] >> 16);
         offset[1] = (unsigned char)((palette[pal_idx] >> 8) & 0xFF);
         offset[2] = (unsigned char)(palette[pal_idx] & 0xFF);
     }
     
-    stbi_write_bmp("out2.bmp", width, height, channel_count, img_data);
+    stbi_write_bmp("out3.bmp", width, height, channel_count, img_data);
+    
+    ElapsedTime write_time_elapsed = end_timer(write_start_time);
+    printf("Completed in %f ms (%lld cycles)\n",
+           write_time_elapsed.milliseconds,
+           write_time_elapsed.cycles);
     
     printf("\nDONE.\n");
     return 0;
