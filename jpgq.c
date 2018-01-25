@@ -4,20 +4,17 @@ Notice: No warranty is offered or implied; use this code at your own risk.
 ********************************************************************************
 TODOs:
 - Color science experiments
-  - Linearize input image colors
-  - Try converting to different color space
   - Try different color distance metric altogether
 - Improve the way the final pixel values are determined
   - Down-scale the image after quantization
   - Add dithering to the output image
   - Try using edge detection if dithering is too hard to control  
 - Improve the way the color palette is calculated
-  - Try different perceived-image-difference metrics, e.g. SSIM
+  - Try different perceived-image-difference metrics, e.g. SSIM, __or__
+    just use the color_dist function we already have lying around???
 - Speed this thing up; I want to do (at least) Full HD input images and a
   256-color palette, running as many iterations as necessary to early-exit,
   and I _never_ want to wait more than a couple seconds
-  - write SIMD variations of the most expensive functions (presumably starting
-    with the loop finding the closest palette color, followed by the averaging
   - possibly multi-threading, though the need for synchronization may kill us
   - (optionally) shrink the search space (e.g. 15-bit RGB color palette)
     => This actually takes _longer_ to converge. We may still want to do it for
@@ -40,7 +37,9 @@ TODOs:
 #define PALETTE_SIZE  32
 #define BEST_PAL_OF    8
 #define ITERATIONS   128
+#define CONVERGENCE_THRESHOLD 50.0f
 #define YCBCR
+#define SIMD_OPT
 
 #undef assert
 #define assert(E) do {         \
@@ -120,21 +119,20 @@ static inline uint32_t next_rand(Random * rng) {
 }
 
 static inline float color_dist(uint32_t a, uint32_t b) {
-    int32_t ra = (int32_t)(a >> 20);
-    int32_t rb = (int32_t)(b >> 20);
-    int32_t delta_r = ra - rb;
+    float a_y = (float)(a >> 20);
+    float b_y = (float)(b >> 20);
+    float delta_y = a_y - b_y; delta_y *= delta_y;
     
-    int32_t ga = (int32_t)((a >> 10) & 0x3FF);
-    int32_t gb = (int32_t)((b >> 10) & 0x3FF);
-    int32_t delta_g = ra - rb;
+    float a_Cb = (float)((a >> 10) & 0x3FF);
+    float b_Cb = (float)((b >> 10) & 0x3FF);
+    float delta_Cb = a_Cb - b_Cb; delta_Cb *= delta_Cb;
     
-    int32_t ba = (int32_t)(a & 0x3FF);
-    int32_t bb = (int32_t)(b & 0x3FF);
-    int32_t delta_b = ba - bb;
+    float a_Cr = (float)(a & 0x3FF);
+    float b_Cr = (float)(b & 0x3FF);
+    float delta_Cr = a_Cr - b_Cr; delta_Cr *= delta_Cr;
     
-    float result = sqrt(delta_r * delta_r +
-                        delta_g * delta_g +
-                        delta_b * delta_b);
+    float result = delta_y + delta_Cb + delta_Cr;
+    if (a == b) assert(result == 0);
     
     return result;
 }
@@ -193,6 +191,67 @@ static inline uint32_t img_read(unsigned char * img_data, uint32_t pixel_idx) {
     return result;
 }
 
+#ifdef SIMD_OPT
+#include <emmintrin.h>
+
+static inline void
+simd_find_closest_color(uint32_t * colors,
+                        uint32_t * palette,
+                        size_t palette_size,
+                        unsigned char * pal_idxs)
+{
+    // Load 4 colors and unpack their components into separate vectors
+    // (so we have (Y0 Y1 Y2 Y3), (Cb0 Cb1 Cb2 Cb3), (Cr0 Cr1 Cr2 Cr3))
+    __m128i ucolors = _mm_load_si128((__m128i const *)colors);
+    __m128i ten_bit_mask = _mm_set1_epi32(0x3FF);
+    
+    __m128 uclrs_y = _mm_cvtepi32_ps(_mm_srli_epi32(ucolors, 20));
+    __m128 uclrs_cb = _mm_cvtepi32_ps(
+        _mm_and_si128(_mm_srli_epi32(ucolors, 10), ten_bit_mask));
+    __m128 uclrs_cr = _mm_cvtepi32_ps(
+        _mm_and_si128(ucolors, ten_bit_mask));
+    
+    // The actual search for palette colors with minimal distances:
+    __m128i min_idxs = _mm_set1_epi32(0);
+    __m128 min_dsts = _mm_set_ps1(FLT_MAX);
+    for (int j = 0; j < palette_size; ++j) {
+        uint32_t pal_color = palette[j];
+        
+        __m128 p_y = _mm_set_ps1((float)(pal_color >> 20));
+        __m128 p_cb = _mm_set_ps1((float)((pal_color >> 10) & 0x3FF));
+        __m128 p_cr = _mm_set_ps1((float)(pal_color & 0x3FF));
+        
+        __m128 delta_y = _mm_sub_ps(uclrs_y, p_y);
+        delta_y = _mm_mul_ps(delta_y, delta_y);
+        
+        __m128 delta_cb = _mm_sub_ps(uclrs_cb, p_cb);
+        delta_cb = _mm_mul_ps(delta_cb, delta_cb);
+        
+        __m128 delta_cr = _mm_sub_ps(uclrs_cr, p_cr);
+        delta_cr = _mm_mul_ps(delta_cr, delta_cr);
+        
+        // NOTE: Since we're only comparing distances (not doing any
+        // arithmetic), and sqrt is monotonically increasing,
+        // skipping it should not change results.
+        
+        __m128 dsts = _mm_add_ps(delta_y, _mm_add_ps(delta_cb, delta_cr));
+        __m128 mask = _mm_cmplt_ps(dsts, min_dsts);
+        
+        dsts = _mm_and_ps(mask, dsts);
+        min_dsts = _mm_andnot_ps(mask, min_dsts);
+        min_dsts = _mm_or_ps(min_dsts, dsts);
+        
+        min_idxs = _mm_andnot_si128(_mm_castps_si128(mask), min_idxs);
+        min_idxs = _mm_or_si128(min_idxs, _mm_and_si128(
+            _mm_castps_si128(mask), _mm_set1_epi32(j)));
+    }
+    
+    pal_idxs[0] = (unsigned char)_mm_extract_epi16(min_idxs, 0);
+    pal_idxs[1] = (unsigned char)_mm_extract_epi16(min_idxs, 2);
+    pal_idxs[2] = (unsigned char)_mm_extract_epi16(min_idxs, 4);
+    pal_idxs[3] = (unsigned char)_mm_extract_epi16(min_idxs, 6);
+}
+#endif
 
 int main(int argc, char ** argv) {
     init_time();
@@ -335,7 +394,18 @@ int main(int argc, char ** argv) {
             
             // Find closest palette color for each unique color:
             TimeStamp pal_assign_start_time = start_timer();
-            for (int i = 0; i < unique_colors_count; ++i) {
+            int i = 0;
+#ifdef SIMD_OPT
+            assert(sizeof(uint64_t) == sizeof(uint32_t *));
+            assert((uint64_t)unique_colors % 16 == 0);
+            
+            for (; i < (unique_colors_count & ~3llu); i += 4) {
+                simd_find_closest_color(&unique_colors[i],
+                                        palette, PALETTE_SIZE,
+                                        &pal_idxs[i]);
+            }
+#endif
+            for (; i < unique_colors_count; ++i) {
                 unsigned char min_idx = 0;
                 float min_dst = color_dist(unique_colors[i], palette[0]);
                 
@@ -406,7 +476,7 @@ int main(int argc, char ** argv) {
                 palette[j] |= (uint32_t)avg_g << 10;
                 palette[j] |= (uint32_t)avg_b;
                 
-                if (palette[j] != palette_old) {
+                if (color_dist(palette[j], palette_old) > CONVERGENCE_THRESHOLD) {
                     updated = 1;
                 }
             }
@@ -513,7 +583,22 @@ int main(int argc, char ** argv) {
     }
     
     // TEMPORARY: Overwrite img_data with paletized image data
-    for (int i = 0; i < img_size; ++i) {
+    int i = 0;
+#ifdef SIMD_OPT
+    for (; i < (img_size & ~3llu); i += 4) {
+        unsigned char pal_idxs[4];
+        simd_find_closest_color(
+            img_padded + i, best_palette, PALETTE_SIZE, pal_idxs);
+        
+        for (int j = 0; j < 4; ++j) {
+            unsigned char * offset = img_data + ((i + j) * 3);
+            offset[0] = (unsigned char)(rgb_palette[pal_idxs[j]] >> 16);
+            offset[1] = (unsigned char)((rgb_palette[pal_idxs[j]] >> 8) & 0xFF);
+            offset[2] = (unsigned char)(rgb_palette[pal_idxs[j]] & 0xFF);
+        }
+    }
+#endif
+    for (; i < img_size; ++i) {
         // Find closest palette color for current pixel:
         unsigned char pal_idx = 0;
         float min_dst = color_dist(img_padded[i], best_palette[0]);
