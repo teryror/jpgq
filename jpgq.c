@@ -10,6 +10,8 @@ TODOs:
   - Add dithering to the output image
   - Try using edge detection if dithering is too hard to control  
 - Improve the way the color palette is calculated
+  - Mess with the color_counts so that small regions with distinct colors are
+    not hurt so much (start with sqrt on all values?)
   - Try different perceived-image-difference metrics, e.g. SSIM, __or__
     just use the color_dist function we already have lying around???
 - Speed this thing up; I want to do (at least) Full HD input images and a
@@ -44,7 +46,7 @@ TODOs:
 #undef assert
 #define assert(E) do {         \
     if (!(E)) *((int *)0) = 0; \
-} while (0);
+} while (0)
 
 #define clamp(min, v, max) do { \
     if (v < (min)) {            \
@@ -52,12 +54,12 @@ TODOs:
     } else if (v > (max)) {     \
         v = (max);              \
     }                           \
-} while (0);
+} while (0)
 
 #define mfree(P) do { \
     assert(P);        \
     free(P); P = 0;   \
-} while (0);
+} while (0)
 
 #include "windows.h"
 
@@ -167,7 +169,7 @@ static inline uint32_t img_read(unsigned char * img_data, uint32_t pixel_idx) {
     result |= g << 10;
     result |= b;
 #else
-    // Convert 8-bit-per-channel YCbCr
+    // Convert to 10-bit-per-channel YCbCr
     float Y = 0.299f*R + 0.587f*G + 0.114f*B;
     clamp(0, Y, 1023.0f);
     
@@ -177,7 +179,7 @@ static inline uint32_t img_read(unsigned char * img_data, uint32_t pixel_idx) {
     float Cr = 512 + 0.5f*R - 0.418687589f*G - 0.081312411f*B;
     clamp(0, Cr, 1023.0f);
     
-    // Pack into 24 bits
+    // Pack into 30 bits
     uint32_t y  = (uint32_t) round(Y);  assert(y  < 0x400);
     uint32_t cb = (uint32_t) round(Cb); assert(cb < 0x400);
     uint32_t cr = (uint32_t) round(Cr); assert(cr < 0x400);
